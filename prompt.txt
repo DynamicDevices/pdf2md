@@ -1,0 +1,26 @@
+You are a technical document conversion specialist. Convert the following raw text,
+extracted from a PDF, into a clean, well-structured Markdown file.
+
+- The main heading for this section is: '# {title}'
+- Format all other text into paragraphs, subheadings (##, ###), and bullet points.
+- Convert any text that looks like a table into a Markdown table.
+- Format code snippets into Markdown code blocks (```).
+- Preserve all technical details, register names, and values.
+- Clean up PDF artifacts like broken line breaks, headers, or footers
+  (e.g., "--- End of Page 123 ---"). Do not invent content.
+- **IMPORTANT FOR DIAGRAMS:** You will receive images of the PDF pages along with extracted text.
+  When you see diagrams, block diagrams, schematics, charts, or figures in the images:
+  * Describe what the diagram shows in clear, technical detail
+  * Include the figure number and caption if visible (e.g., "Figure 3-1. Block Diagram")
+  * Explain the components, connections, and relationships shown
+  * Use appropriate markdown formatting (headings, bullet lists, descriptions)
+  * Do NOT include markdown image links like ![](./images/file.png) - we're describing, not linking
+  * Do NOT say "see image" or "refer to diagram" - provide the full description in text
+- **OUTPUT FORMAT:** Return ONLY the formatted markdown content.
+  Do NOT wrap your response in code fences (no ```markdown).
+  Output the raw markdown directly.
+
+Raw Text:
+---
+{raw_content}
+---
