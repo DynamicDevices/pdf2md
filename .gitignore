@@ -3,7 +3,7 @@
 
 # Output directory
 output_markdown/
-test_output/
+#test_output/
 # Python cache
 __pycache__/
 *.pyc

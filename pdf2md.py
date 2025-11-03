@@ -197,7 +197,8 @@ def convert_pdf_to_markdown(pdf_path, output_dir, prompt_file="prompt.txt"):
 
     # --- 0. Configure API ---
     google_api_key = os.getenv("GOOGLE_API_KEY")
-    llm_model_name = os.getenv("LLM_MODEL_NAME", "gemini-1.5-flash")
+    llm_model_name = os.getenv("LLM_MODEL_NAME", "gemini-2.5-flash")
+    llm_model_text_only = os.getenv("LLM_MODEL_TEXT_ONLY", "gemini-2.5-flash")
 
     if not google_api_key or google_api_key == "your_api_key_here":
         print("Error: GOOGLE_API_KEY is not set.")
@@ -206,8 +207,10 @@ def convert_pdf_to_markdown(pdf_path, output_dir, prompt_file="prompt.txt"):
 
     try:
         genai.configure(api_key=google_api_key)
-        model = genai.GenerativeModel(llm_model_name)
-        print(f"Successfully configured Gemini model: {llm_model_name}")
+        model_vision = genai.GenerativeModel(llm_model_name)
+        model_text = genai.GenerativeModel(llm_model_text_only)
+        print(f"Vision model (with images): {llm_model_name}")
+        print(f"Text-only model (no images): {llm_model_text_only}")
     except Exception as e:
         print(f"Error: Could not configure Google AI. Check your API key. {e}")
         return
@@ -253,24 +256,39 @@ def convert_pdf_to_markdown(pdf_path, output_dir, prompt_file="prompt.txt"):
     
     # --- 4. Process Each Document Section ---
     print("\nStarting section processing...")
-    
+
+    # Track which pages have been processed to avoid duplication
+    processed_pages = set()
+
     for i, entry in enumerate(toc):
         level, title, start_page = entry
-        
+
         # Page numbers in PyMuPDF ToC are 1-indexed, pages are 0-indexed
-        start_page_idx = start_page - 1 
-        
+        start_page_idx = start_page - 1
+
         # Determine end page
         if i + 1 < len(toc):
             # End page is the page *before* the next section starts
-            end_page_idx = toc[i+1][2] - 2 
+            end_page_idx = toc[i+1][2] - 2
         else:
             # This is the last section, go to the end of the document
             end_page_idx = doc.page_count - 1
-            
+
         # Ensure start/end pages are valid (for single-page sections)
         if start_page_idx > end_page_idx:
             end_page_idx = start_page_idx
+
+        # Skip this section if all its pages have already been processed
+        pages_in_section = set(range(start_page_idx, end_page_idx + 1))
+        new_pages = pages_in_section - processed_pages
+
+        if not new_pages:
+            print(f"\nSkipping: '{title}' (Pages {start_page_idx + 1} to {end_page_idx + 1}) - already processed")
+            continue
+
+        # Only process pages that haven't been seen yet
+        start_page_idx = min(new_pages)
+        end_page_idx = max(new_pages)
             
         print(f"\nProcessing: '{title}' (Pages {start_page_idx + 1} to {end_page_idx + 1})")
 
@@ -367,17 +385,28 @@ def convert_pdf_to_markdown(pdf_path, output_dir, prompt_file="prompt.txt"):
 
             section_raw_content += f"\n--- End of Page {page_num + 1} ---\n"
 
-        # 4c. Format content (using the real LLM with page images for diagram context)
+        # 4c. Format content (using appropriate LLM based on content type)
         if not section_raw_content.strip():
              print(f"  Skipping '{title}' - no content extracted.")
              continue
 
-        formatted_markdown = call_llm_api(section_raw_content, title, model, prompt_template, page_images, image_references)
+        # Select model: use vision model if we have images, otherwise use text-only model
+        if page_images:
+            selected_model = model_vision
+            print(f"  Using vision model ({llm_model_name}) - section has {len(page_images)} image(s)")
+        else:
+            selected_model = model_text
+            print(f"  Using text-only model ({llm_model_text_only}) - no images")
+
+        formatted_markdown = call_llm_api(section_raw_content, title, selected_model, prompt_template, page_images, image_references)
         
         # 4d. Save the final Markdown file for this section
         section_md_path = os.path.join(output_dir, section_filename)
         with open(section_md_path, "w", encoding="utf-8") as f:
             f.write(formatted_markdown)
+
+        # 4e. Mark these pages as processed
+        processed_pages.update(range(start_page_idx, end_page_idx + 1))
 
     doc.close()
     print("\n--- Conversion Complete! ---")
