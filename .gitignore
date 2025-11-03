@@ -2,7 +2,7 @@
 .env
 
 # Output directory
-output_markdown/
+#output_markdown/
 #test_output/
 # Python cache
 __pycache__/
