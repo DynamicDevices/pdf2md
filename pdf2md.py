@@ -37,12 +37,9 @@ extracted from a PDF, into a clean, well-structured Markdown file.
 - Convert any text that looks like a table into a Markdown table.
 - Format code snippets into Markdown code blocks (```).
 - Preserve all technical details, register names, and values.
-- **CRITICAL:** When you see a placeholder like
-  [IMAGE_PLACEHOLDER: filename.png, alt=Some Text],
-  convert it to a standard Markdown image link:
-  ![Some Text](./images/filename.png)
-- Clean up PDF artifacts like broken line breaks, headers, or footers
-  (e.g., "--- End of Page 123 ---"). Do not invent content.
+- For diagrams: Include image links AND text descriptions.
+- Clean up PDF artifacts like broken line breaks, headers, or footers.
+{image_references}
 
 Raw Text:
 ---
@@ -118,6 +115,74 @@ def call_llm_api(raw_content, title, model, prompt_template, page_images=None, i
         fallback_content += re.sub(footer_pattern, "\n\n", raw_content)
 
         return fallback_content
+
+
+def is_real_diagram(page, drawings):
+    """
+    Determine if a page contains real technical diagrams vs just tables/headers/footers.
+
+    Uses smart heuristics based on:
+    - Page coverage percentage
+    - Size of largest drawing element
+    - Ratio of small vs large drawings
+
+    Args:
+        page: PyMuPDF page object
+        drawings: List of drawing objects from page.get_drawings()
+
+    Returns:
+        (bool, str): (should_save_image, reason_for_decision)
+    """
+    if not drawings:
+        return False, "no drawings found"
+
+    # Get page dimensions
+    rect = page.rect
+    page_area = rect.width * rect.height
+
+    if page_area == 0:
+        return False, "invalid page area"
+
+    # Analyze drawings
+    total_drawing_area = 0
+    drawing_sizes = []
+    small_drawing_count = 0
+
+    for drawing in drawings:
+        if 'rect' in drawing:
+            r = drawing['rect']
+            width = r[2] - r[0]
+            height = r[3] - r[1]
+            area = width * height
+
+            total_drawing_area += area
+            drawing_sizes.append(area)
+
+            # Count small drawings (likely table borders, lines)
+            if area < 100:
+                small_drawing_count += 1
+
+    # Calculate metrics
+    coverage_percent = (total_drawing_area / page_area) * 100
+    largest_drawing = max(drawing_sizes) if drawing_sizes else 0
+    small_ratio = (small_drawing_count / len(drawings)) * 100 if drawings else 0
+
+    # Decision logic
+    # Real diagrams typically have:
+    # - High page coverage (>20%) OR large elements (>50k sq units)
+    # - Not mostly tiny elements (<80% small)
+
+    if coverage_percent > 20:
+        return True, f"high coverage ({coverage_percent:.1f}%)"
+
+    if largest_drawing > 50000:
+        return True, f"large element ({largest_drawing:.0f} sq units)"
+
+    if coverage_percent > 10 and small_ratio < 80:
+        return True, f"moderate coverage ({coverage_percent:.1f}%) with substantial elements"
+
+    # Likely just tables, headers, or formatting
+    return False, f"low coverage ({coverage_percent:.1f}%), small elements ({small_ratio:.0f}% tiny)"
 
 
 def convert_pdf_to_markdown(pdf_path, output_dir, prompt_file="prompt.txt"):
@@ -222,35 +287,83 @@ def convert_pdf_to_markdown(pdf_path, output_dir, prompt_file="prompt.txt"):
                 print(f"  Warning: Could not load page {page_num + 1}. Skipping. Error: {e}")
                 continue
 
-            # Render page as image for multimodal LLM (to capture diagrams)
-            try:
-                # Render at 2x resolution for better quality (150 DPI)
-                zoom = 2.0
-                mat = fitz.Matrix(zoom, zoom)
-                pix = page.get_pixmap(matrix=mat)
-                img_data = pix.tobytes("png")
-                pil_image = Image.open(io.BytesIO(img_data))
-
-                # Save the rendered page image
-                img_filename = f"page_{page_num + 1}.png"
-                img_path = os.path.join(img_dir, img_filename)
-                pil_image.save(img_path)
-
-                # Store for multimodal API and track reference
-                page_images.append(pil_image)
-                image_references.append(f"./images/{img_filename}")
-
-            except Exception as e:
-                print(f"  Warning: Could not render page {page_num + 1} as image: {e}")
-
             blocks = page.get_text("dict")["blocks"]
 
+            # Extract text content
             for block in blocks:
                 if block["type"] == 0:  # This is a text block
                     for line in block["lines"]:
                         for span in line["spans"]:
                             section_raw_content += span["text"] + " "
                         section_raw_content += "\n"
+
+            # Check for and extract embedded images (bitmaps)
+            embedded_images_found = False
+            for block in blocks:
+                if block["type"] == 1:  # This is an embedded image block
+                    try:
+                        img_xref = block["xref"]
+                        if img_xref == 0:
+                            continue
+
+                        img = doc.extract_image(img_xref)
+                        img_bytes = img["image"]
+                        img_ext = img["ext"]
+
+                        img_filename = f"page_{page_num + 1}_img_{img_xref}.{img_ext}"
+                        img_path = os.path.join(img_dir, img_filename)
+
+                        with open(img_path, "wb") as img_file:
+                            img_file.write(img_bytes)
+
+                        # Load as PIL image for multimodal API
+                        pil_image = Image.open(io.BytesIO(img_bytes))
+                        page_images.append(pil_image)
+                        image_references.append(f"./images/{img_filename}")
+                        embedded_images_found = True
+                        print(f"    Extracted embedded image: {img_filename}")
+
+                    except Exception as e:
+                        print(f"  Warning: Could not extract embedded image on page {page_num + 1}: {e}")
+
+            # Check if page has real diagrams (not just tables/headers)
+            # Use smart heuristics to filter false positives
+            should_save_diagram = False
+            try:
+                # Get the page's drawing commands to see if there are vector graphics
+                drawings = page.get_drawings()
+                if drawings and len(drawings) > 0:
+                    is_diagram, reason = is_real_diagram(page, drawings)
+                    if is_diagram:
+                        should_save_diagram = True
+                        print(f"    ✓ Page {page_num + 1}: Diagram detected - {reason}")
+                    else:
+                        print(f"    ✗ Page {page_num + 1}: Skipping - {reason}")
+            except Exception as e:
+                print(f"  Warning: Error analyzing drawings on page {page_num + 1}: {e}")
+
+            # Only render full page if there are real diagrams that couldn't be extracted
+            if should_save_diagram and not embedded_images_found:
+                try:
+                    # Render at 2x resolution for better quality (150 DPI)
+                    zoom = 2.0
+                    mat = fitz.Matrix(zoom, zoom)
+                    pix = page.get_pixmap(matrix=mat)
+                    img_data = pix.tobytes("png")
+                    pil_image = Image.open(io.BytesIO(img_data))
+
+                    # Save the rendered page image
+                    img_filename = f"page_{page_num + 1}_diagram.png"
+                    img_path = os.path.join(img_dir, img_filename)
+                    pil_image.save(img_path)
+
+                    # Store for multimodal API and track reference
+                    page_images.append(pil_image)
+                    image_references.append(f"./images/{img_filename}")
+                    print(f"    Rendered full page diagram: {img_filename}")
+
+                except Exception as e:
+                    print(f"  Warning: Could not render page {page_num + 1} as image: {e}")
 
             section_raw_content += f"\n--- End of Page {page_num + 1} ---\n"
 
