@@ -21,6 +21,11 @@ This is a one-time conversion tool that favors quality over performance. The out
 - Creates a master index file for easy navigation
 - Configurable via environment variables and command-line arguments
 - Customizable LLM prompt template
+- **Parallel processing** with configurable worker count for faster conversions
+- **Resume capability** - automatically skips already-processed sections
+- **Smart diagram detection** - filters out false positives (tables, headers) from real diagrams
+- **Dual model support** - uses vision model for pages with diagrams, text-only model otherwise
+- **Exponential backoff** for API rate limit handling
 
 ## Installation
 
@@ -62,13 +67,18 @@ Create a `.env` file based on `.env.example`:
 # Google API Configuration
 GOOGLE_API_KEY=your_api_key_here
 
-# Model to use (gemini-1.5-flash is fast/cheap, gemini-1.5-pro is slower/better)
-LLM_MODEL_NAME=gemini-1.5-flash
+# Vision model - used for pages with diagrams/images (multimodal)
+LLM_MODEL_NAME=gemini-2.5-flash
+
+# Text-only model - used for pages without images (faster/cheaper)
+LLM_MODEL_TEXT_ONLY=gemini-2.5-flash
 
 # Default paths (optional, can override via command line)
 PDF_PATH=cc1312r7.pdf
 OUTPUT_DIR=output_markdown
 ```
+
+The tool automatically selects the appropriate model based on whether a page contains diagrams or images. You can use different models for each purpose (e.g., a more capable model for vision tasks).
 
 ### Prompt Template (prompt.txt)
 
@@ -101,10 +111,17 @@ python pdf2md.py -i /path/to/manual.pdf -o output_directory
 python pdf2md.py -i manual.pdf -o output_md -p custom_prompt.txt
 ```
 
+### Parallel Processing with More Workers
+
+```bash
+# Use 8 parallel workers for faster processing
+python pdf2md.py -i manual.pdf -o output_md -w 8
+```
+
 ### Command Line Options
 
 ```
-usage: pdf2md.py [-h] [-i PDF_PATH] [-o OUTPUT_DIR] [-p PROMPT_FILE]
+usage: pdf2md.py [-h] [-i PDF_PATH] [-o OUTPUT_DIR] [-p PROMPT_FILE] [-w MAX_WORKERS]
 
 Convert large technical PDF files to structured Markdown with images.
 
@@ -116,6 +133,8 @@ optional arguments:
                         Output directory for markdown files (default: from .env or 'output_markdown')
   -p PROMPT_FILE, --prompt PROMPT_FILE
                         Path to LLM prompt template file (default: 'prompt.txt')
+  -w MAX_WORKERS, --workers MAX_WORKERS
+                        Maximum number of parallel LLM API calls (default: 4)
 ```
 
 ## Output Structure
@@ -141,14 +160,17 @@ output_markdown/
 ## How It Works
 
 1. **Extract Table of Contents**: Uses PyMuPDF to read the PDF's ToC structure
-2. **Process Each Section**: For each ToC entry:
+2. **Process Each Section** (Phase 1 - Sequential): For each ToC entry:
    - Extracts text and images from the relevant page range
-   - Saves images to the `images/` directory
-   - Inserts image placeholders in the text
-3. **Format with LLM**: Sends the raw extracted text to Gemini API to:
-   - Clean up PDF artifacts (page breaks, headers, footers)
-   - Format as proper Markdown (headings, lists, tables, code blocks)
-   - Convert image placeholders to Markdown image syntax
+   - Detects diagrams using smart heuristics (page coverage, element sizes)
+   - Saves embedded images and renders full-page diagrams when appropriate
+   - Skips already-processed sections (resume capability)
+3. **Format with LLM** (Phase 2 - Parallel): Using configurable worker threads:
+   - Selects vision model for pages with images, text-only model otherwise
+   - Cleans up PDF artifacts (page breaks, headers, footers)
+   - Formats as proper Markdown (headings, lists, tables, code blocks)
+   - Writes output files immediately as each section completes
+   - Implements exponential backoff for rate limit handling
 4. **Save Output**: Creates individual markdown files for each section plus a master index
 
 ## Requirements
@@ -157,14 +179,17 @@ output_markdown/
 - PyMuPDF (fitz) - PDF processing
 - google-generativeai - Gemini API access
 - python-dotenv - Environment variable management
+- Pillow (PIL) - Image processing for multimodal API
 
 ## Cost Considerations
 
 The tool uses Google's Gemini API, which charges based on tokens processed:
-- **gemini-1.5-flash**: Fast and cost-effective (~$0.075 per 1M input tokens)
-- **gemini-1.5-pro**: More capable but slower/expensive (~$1.25 per 1M input tokens)
+- **gemini-2.5-flash**: Fast and cost-effective (default)
+- **gemini-2.5-pro**: More capable but slower/expensive
 
-For a 2100-page technical manual, expect to process several million tokens. Monitor your usage at [Google AI Studio](https://aistudio.google.com/).
+Check current pricing at [Google AI Studio](https://aistudio.google.com/).
+
+For a 2100-page technical manual, expect to process several million tokens. The dual-model approach helps reduce costs by using text-only processing for pages without diagrams.
 
 ## Troubleshooting
 
@@ -178,14 +203,52 @@ For a 2100-page technical manual, expect to process several million tokens. Moni
 - Consider manually splitting PDFs without ToC structure
 
 ### LLM API rate limits
-- The script includes a 1-second delay between API calls
-- For rate limit errors, consider adding longer delays in `call_llm_api()`
-- Use `gemini-1.5-flash` for faster processing with lower rate limits
+- The script implements automatic exponential backoff (1s, 2s, 4s, 8s, 16s delays)
+- Rate limit errors (429) are automatically retried up to 5 times
+- Reduce `--workers` if you consistently hit rate limits
+- Use `gemini-2.5-flash` for higher rate limits
 
 ### Images not extracting
 - Some PDFs have embedded images that are difficult to extract
 - Check the `images/` folder to verify what was extracted
-- Vector graphics may not extract properly (PyMuPDF limitation)
+- Vector graphics are rendered as full-page images when detected as real diagrams
+
+### Resuming interrupted conversions
+- The tool automatically detects existing output files and skips re-processing them
+- Simply re-run the same command to resume from where you left off
+- Delete specific `.md` files if you want to regenerate them
+
+## Planned Improvements
+
+### Multi-Provider LLM Support
+
+Currently the tool only supports Google's Gemini API. Future versions will add support for:
+
+- **OpenAI** (GPT-4o, GPT-4o-mini) - Vision and text models
+- **Anthropic Claude** (Claude Sonnet, Claude Haiku) - Vision and text models
+- **Local LLMs** (Ollama, llama.cpp) - For offline/private processing
+
+**Implementation Strategy:**
+
+1. **Provider Abstraction Layer** - Create a base `LLMProvider` class with common interface methods (`generate_content()`, `supports_vision()`, `get_model_info()`)
+
+2. **Provider Implementations** - Each provider gets its own class:
+   - `GeminiProvider` (current implementation, refactored)
+   - `OpenAIProvider` (using `openai` package)
+   - `ClaudeProvider` (using `anthropic` package)
+   - `OllamaProvider` (using `ollama` package or REST API)
+
+3. **Configuration** - Select provider via environment variable or CLI flag:
+   ```bash
+   # Via environment
+   LLM_PROVIDER=openai
+   OPENAI_API_KEY=sk-...
+
+   # Via command line
+   python pdf2md.py -i manual.pdf --provider claude
+   ```
+
+4. **Graceful Fallback** - Vision models used when available; automatic fallback to text-only for providers/models without vision support
 
 ## License
 
@@ -193,7 +256,8 @@ This tool is provided as-is for technical document conversion purposes.
 
 ## Notes
 
-- This is a one-time conversion tool, not designed for batch processing
-- Quality is prioritized over performance
+- This is a one-time conversion tool designed for large technical reference documents
+- Quality is prioritized over performance, but parallel processing speeds up conversions
 - The output is optimized for AI agent consumption, not human reading
-- Large PDFs may take considerable time to process due to API rate limits
+- Large PDFs benefit from the parallel workers feature (`-w` flag)
+- The resume capability makes it safe to interrupt and restart long conversions
