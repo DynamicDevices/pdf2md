@@ -2,11 +2,13 @@ import fitz  # PyMuPDF
 import os
 import re
 import google.generativeai as genai
-import time
 import argparse
 from dotenv import load_dotenv
 from PIL import Image
 import io
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 # Load environment variables from .env file
 load_dotenv()
@@ -66,9 +68,10 @@ def strip_markdown_fence(text):
     return text
 
 
-def call_llm_api(raw_content, title, model, prompt_template, page_images=None, image_references=None):
+def call_llm_api(raw_content, title, model, prompt_template, page_images=None, image_references=None, max_retries=5):
     """
     Uses the Google Generative AI (Gemini) API to format raw text into markdown.
+    Implements exponential backoff for rate limit errors (429).
 
     Args:
         raw_content: Raw text extracted from PDF
@@ -77,6 +80,7 @@ def call_llm_api(raw_content, title, model, prompt_template, page_images=None, i
         prompt_template: Prompt template string
         page_images: Optional list of PIL Image objects for multimodal processing
         image_references: Optional list of image file paths for markdown links
+        max_retries: Maximum number of retry attempts for rate limit errors
     """
 
     # Format image references for the prompt
@@ -88,33 +92,54 @@ def call_llm_api(raw_content, title, model, prompt_template, page_images=None, i
 
     llm_prompt = prompt_template.format(title=title, raw_content=raw_content, image_references=image_refs_text)
 
-    try:
-        print(f"  (Gemini API) Sending to format: {title}")
+    # Retry loop with exponential backoff
+    for attempt in range(max_retries):
+        try:
+            if attempt == 0:
+                print(f"  (Gemini API) Sending to format: {title}", flush=True)
+            else:
+                print(f"  (Gemini API) Retry {attempt}/{max_retries-1} for: {title}", flush=True)
 
-        # If we have page images, send them along with the text for better diagram understanding
-        if page_images:
-            content_parts = [llm_prompt]
-            content_parts.extend(page_images)
-            response = model.generate_content(content_parts)
-        else:
-            response = model.generate_content(llm_prompt)
+            # If we have page images, send them along with the text for better diagram understanding
+            if page_images:
+                content_parts = [llm_prompt]
+                content_parts.extend(page_images)
+                response = model.generate_content(content_parts)
+            else:
+                response = model.generate_content(llm_prompt)
 
-        # Add a small delay to avoid hitting rate limits on rapid, small sections
-        time.sleep(1)
+            # Strip markdown code fences if present
+            result = strip_markdown_fence(response.text)
+            return result
 
-        # Strip markdown code fences if present
-        result = strip_markdown_fence(response.text)
-        return result
-    except Exception as e:
-        print(f"  ERROR: LLM API call failed for '{title}': {e}")
-        # Fallback to simple formatting on error
-        fallback_content = f"# {title}\n\n[LLM_API_ERROR: {e}]\n\n"
+        except Exception as e:
+            error_str = str(e)
 
-        # Clean up page markers
-        footer_pattern = re.compile(r"\n--- End of Page \d+ ---\n")
-        fallback_content += re.sub(footer_pattern, "\n\n", raw_content)
+            # Check if this is a rate limit error (429)
+            if "429" in error_str or "Resource Exhausted" in error_str or "quota" in error_str.lower():
+                if attempt < max_retries - 1:
+                    # Exponential backoff: 2^attempt seconds (1s, 2s, 4s, 8s, 16s)
+                    wait_time = 2 ** attempt
+                    print(f"  ⏳ Rate limit hit for '{title}', waiting {wait_time}s before retry...", flush=True)
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"  ERROR: Rate limit exceeded after {max_retries} retries for '{title}'", flush=True)
+            else:
+                # Non-rate-limit error, don't retry
+                print(f"  ERROR: LLM API call failed for '{title}': {e}", flush=True)
 
-        return fallback_content
+            # Fallback to simple formatting on error
+            fallback_content = f"# {title}\n\n[LLM_API_ERROR: {e}]\n\n"
+
+            # Clean up page markers
+            footer_pattern = re.compile(r"\n--- End of Page \d+ ---\n")
+            fallback_content += re.sub(footer_pattern, "\n\n", raw_content)
+
+            return fallback_content
+
+    # Should never reach here, but just in case
+    return f"# {title}\n\n[ERROR: Max retries exceeded]\n\n{raw_content}"
 
 
 def is_real_diagram(page, drawings):
@@ -185,7 +210,7 @@ def is_real_diagram(page, drawings):
     return False, f"low coverage ({coverage_percent:.1f}%), small elements ({small_ratio:.0f}% tiny)"
 
 
-def convert_pdf_to_markdown(pdf_path, output_dir, prompt_file="prompt.txt"):
+def convert_pdf_to_markdown(pdf_path, output_dir, prompt_file="prompt.txt", max_workers=4):
     """
     Main function to convert the PDF to a structured set of Markdown files.
 
@@ -193,6 +218,7 @@ def convert_pdf_to_markdown(pdf_path, output_dir, prompt_file="prompt.txt"):
         pdf_path: Path to the input PDF file
         output_dir: Directory to save the markdown files
         prompt_file: Path to the LLM prompt template file
+        max_workers: Maximum number of parallel LLM API calls (default: 4)
     """
 
     # --- 0. Configure API ---
@@ -239,26 +265,17 @@ def convert_pdf_to_markdown(pdf_path, output_dir, prompt_file="prompt.txt"):
 
     print(f"Found {len(toc)} sections in the Table of Contents.")
 
-    # --- 3. Create Master index.md ---
-    index_md_path = os.path.join(output_dir, "index.md")
-    with open(index_md_path, "w", encoding="utf-8") as f:
-        f.write("# Technical Reference Manual - Index\n\n")
-        f.write("This document provides a top-level index for the converted technical manual.\n\n")
-        
-        for entry in toc:
-            level, title, page = entry
-            indent = "  " * (level - 1)
-            filename = sanitize_filename(title)
-            # Link to the markdown file
-            f.write(f"{indent}* [{title} (Page {page})](./{filename})\n")
-
-    print(f"Master 'index.md' created.")
-    
-    # --- 4. Process Each Document Section ---
-    print("\nStarting section processing...")
+    # --- 3. Extract Content from All Sections (Sequential) ---
+    print("\nPhase 1: Extracting content from sections...")
 
     # Track which pages have been processed to avoid duplication
     processed_pages = set()
+
+    # Collect all sections to process
+    sections_to_process = []
+
+    # Track sections for index.md (includes metadata for TOC structure)
+    sections_for_index = []
 
     for i, entry in enumerate(toc):
         level, title, start_page = entry
@@ -283,14 +300,14 @@ def convert_pdf_to_markdown(pdf_path, output_dir, prompt_file="prompt.txt"):
         new_pages = pages_in_section - processed_pages
 
         if not new_pages:
-            print(f"\nSkipping: '{title}' (Pages {start_page_idx + 1} to {end_page_idx + 1}) - already processed")
+            print(f"  Skipping: '{title}' (Pages {start_page_idx + 1} to {end_page_idx + 1}) - already processed")
             continue
 
         # Only process pages that haven't been seen yet
         start_page_idx = min(new_pages)
         end_page_idx = max(new_pages)
-            
-        print(f"\nProcessing: '{title}' (Pages {start_page_idx + 1} to {end_page_idx + 1})")
+
+        print(f"  Extracting: '{title}' (Pages {start_page_idx + 1} to {end_page_idx + 1})")
 
         section_raw_content = ""
         section_filename = sanitize_filename(title)
@@ -385,33 +402,165 @@ def convert_pdf_to_markdown(pdf_path, output_dir, prompt_file="prompt.txt"):
 
             section_raw_content += f"\n--- End of Page {page_num + 1} ---\n"
 
-        # 4c. Format content (using appropriate LLM based on content type)
+        # 4c. Check if section has content and collect for processing
         if not section_raw_content.strip():
              print(f"  Skipping '{title}' - no content extracted.")
              continue
 
-        # Select model: use vision model if we have images, otherwise use text-only model
-        if page_images:
-            selected_model = model_vision
-            print(f"  Using vision model ({llm_model_name}) - section has {len(page_images)} image(s)")
-        else:
-            selected_model = model_text
-            print(f"  Using text-only model ({llm_model_text_only}) - no images")
-
-        formatted_markdown = call_llm_api(section_raw_content, title, selected_model, prompt_template, page_images, image_references)
-        
-        # 4d. Save the final Markdown file for this section
+        # Check if output file already exists (for resume capability)
         section_md_path = os.path.join(output_dir, section_filename)
-        with open(section_md_path, "w", encoding="utf-8") as f:
-            f.write(formatted_markdown)
+        file_exists = os.path.exists(section_md_path)
 
-        # 4e. Mark these pages as processed
+        # Track for index.md (preserve TOC structure) - do this regardless of whether we process
+        sections_for_index.append({
+            'level': level,
+            'title': title,
+            'page': start_page,
+            'filename': section_filename
+        })
+
+        # If file already exists, skip LLM processing but keep in index
+        if file_exists:
+            print(f"  ✓ Resuming: '{title}' already exists, skipping LLM processing")
+        else:
+            # Select model: use vision model if we have images, otherwise use text-only model
+            if page_images:
+                selected_model = model_vision
+                model_info = f"vision ({llm_model_name}, {len(page_images)} image(s))"
+            else:
+                selected_model = model_text
+                model_info = f"text-only ({llm_model_text_only})"
+
+            # Collect section data for parallel processing
+            sections_to_process.append({
+                'title': title,
+                'filename': section_filename,
+                'raw_content': section_raw_content,
+                'page_images': page_images,
+                'image_references': image_references,
+                'model': selected_model,
+                'model_info': model_info
+            })
+
+        # Mark these pages as processed
         processed_pages.update(range(start_page_idx, end_page_idx + 1))
 
     doc.close()
-    print("\n--- Conversion Complete! ---")
-    print(f"All files saved in '{output_dir}'.")
-    print(f"Start by opening '{index_md_path}' to navigate your new files.")
+
+    # Show resume statistics
+    total_sections = len(sections_for_index)
+    new_sections = len(sections_to_process)
+    resumed_sections = total_sections - new_sections
+
+    print(f"\nPhase 1 Complete:")
+    print(f"  Total sections: {total_sections}")
+    print(f"  New sections to process: {new_sections}")
+    if resumed_sections > 0:
+        print(f"  Resumed (already exist): {resumed_sections}")
+    print()
+
+    # --- 5. Format All Sections with LLM (Parallel) ---
+    if new_sections == 0:
+        print("\nPhase 2: All sections already exist, skipping LLM processing.\n")
+    else:
+        print(f"\nPhase 2: Formatting {new_sections} new sections with LLM (max {max_workers} parallel workers)...")
+        print("(Files will be written as they complete)\n")
+
+    def format_and_write_section(section_data):
+        """Format a single section using the LLM API and write it immediately."""
+        try:
+            title = section_data['title']
+            filename = section_data['filename']
+            model_info = section_data['model_info']
+
+            print(f"  → Formatting '{title}' using {model_info}", flush=True)
+
+            formatted_markdown = call_llm_api(
+                section_data['raw_content'],
+                section_data['title'],
+                section_data['model'],
+                prompt_template,
+                section_data['page_images'],
+                section_data['image_references']
+            )
+
+            # Write immediately after formatting
+            section_md_path = os.path.join(output_dir, filename)
+            with open(section_md_path, "w", encoding="utf-8") as f:
+                f.write(formatted_markdown)
+
+            print(f"  ✓ Completed and wrote '{title}' -> {filename}", flush=True)
+            return (filename, True)
+
+        except Exception as e:
+            print(f"  ✗ Error formatting '{section_data['title']}': {e}", flush=True)
+            # Write error fallback
+            try:
+                section_md_path = os.path.join(output_dir, section_data['filename'])
+                with open(section_md_path, "w", encoding="utf-8") as f:
+                    f.write(f"# {section_data['title']}\n\n[ERROR: {e}]\n\n{section_data['raw_content']}")
+                return (section_data['filename'], False)
+            except Exception as write_err:
+                print(f"  ✗ Could not write error file: {write_err}", flush=True)
+                return (section_data['filename'], False)
+
+    # Process all sections in parallel, writing as they complete
+    if len(sections_to_process) > 0:
+        completed_count = 0
+        error_count = 0
+        total_sections_to_process = len(sections_to_process)
+
+        print(f"Starting parallel processing of {total_sections_to_process} sections...", flush=True)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_section = {executor.submit(format_and_write_section, section): section for section in sections_to_process}
+
+            for future in as_completed(future_to_section):
+                try:
+                    filename, success = future.result()
+                    completed_count += 1
+                    if not success:
+                        error_count += 1
+
+                    # Show progress
+                    percent = (completed_count / total_sections_to_process) * 100
+                    print(f"\n  Progress: {completed_count}/{total_sections_to_process} sections ({percent:.1f}%)", flush=True)
+
+                except Exception as e:
+                    completed_count += 1
+                    error_count += 1
+                    print(f"  ✗ Unexpected error processing section: {e}", flush=True)
+
+        print("\nAll sections processed, closing thread pool...", flush=True)
+
+    # --- 6. Create Master Index ---
+    print("Creating index.md with links to all created sections...", flush=True)
+
+    index_md_path = os.path.join(output_dir, "index.md")
+    with open(index_md_path, "w", encoding="utf-8") as f:
+        f.write("# Technical Reference Manual - Index\n\n")
+        f.write("This document provides a top-level index for the converted technical manual.\n\n")
+
+        for section in sections_for_index:
+            level = section['level']
+            title = section['title']
+            page = section['page']
+            filename = section['filename']
+            indent = "  " * (level - 1)
+            f.write(f"{indent}* [{title} (Page {page})](./{filename})\n")
+
+    print(f"Index created with {len(sections_for_index)} sections.", flush=True)
+
+    # Summary
+    print("\n" + "=" * 60, flush=True)
+    print("Conversion Complete!", flush=True)
+    print("=" * 60, flush=True)
+    print(f"Sections processed:  {completed_count}/{len(sections_to_process)}", flush=True)
+    if error_count > 0:
+        print(f"Errors encountered:  {error_count}", flush=True)
+    print(f"Output directory:    {output_dir}", flush=True)
+    print(f"Start with:          {index_md_path}", flush=True)
+    print("=" * 60, flush=True)
 
 
 def main():
@@ -451,18 +600,27 @@ Configuration:
         help="Path to LLM prompt template file (default: 'prompt.txt')"
     )
 
+    parser.add_argument(
+        "-w", "--workers",
+        dest="max_workers",
+        type=int,
+        default=4,
+        help="Maximum number of parallel LLM API calls (default: 4)"
+    )
+
     args = parser.parse_args()
 
     print("=" * 60)
     print("PDF to Markdown Converter")
     print("=" * 60)
-    print(f"Input PDF:  {args.pdf_path}")
-    print(f"Output Dir: {args.output_dir}")
-    print(f"Prompt:     {args.prompt_file}")
+    print(f"Input PDF:      {args.pdf_path}")
+    print(f"Output Dir:     {args.output_dir}")
+    print(f"Prompt:         {args.prompt_file}")
+    print(f"Max Workers:    {args.max_workers}")
     print("=" * 60)
     print()
 
-    convert_pdf_to_markdown(args.pdf_path, args.output_dir, args.prompt_file)
+    convert_pdf_to_markdown(args.pdf_path, args.output_dir, args.prompt_file, args.max_workers)
 
 
 if __name__ == "__main__":
