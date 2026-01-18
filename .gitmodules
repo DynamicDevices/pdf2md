@@ -1,0 +1,4 @@
+[submodule "datasheets"]
+	path = datasheets
+	url = git@github.com:DynamicDevices/datasheets.git
+	branch = main
