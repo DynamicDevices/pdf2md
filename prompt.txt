@@ -9,6 +9,21 @@ extracted from a PDF, into a clean, well-structured Markdown file.
 - Clean up PDF artifacts like broken line breaks, headers, or footers
   (e.g., "--- End of Page 123 ---"). Do not invent content.
 
+- **CRITICAL FOR CODE / COMMANDS / CONFIG:**
+  - If you see shell scripts, command output, config files, code blocks, register dumps, or anything that looks like code:
+    - Preserve the content verbatim (do not "fix", rewrite, or refactor it).
+    - Preserve whitespace and line breaks as much as possible.
+    - Wrap it in an appropriate Markdown code fence (```bash, ```text, etc.).
+    - If the extracted code looks partially broken/wrapped, keep it verbatim anyway rather than guessing.
+
+- **CRITICAL FOR VERBATIM SECTIONS (TABLES):**
+  - Any content between these markers must be preserved EXACTLY (character-for-character):
+    - `<!-- VERBATIM_TABLE_START -->`
+    - `<!-- VERBATIM_TABLE_END -->`
+  - Do not reformat, reorder rows/columns, or change any numbers/units inside these blocks.
+  - You may also see placeholders like `<<VERBATIM_TABLE_01>>`. Do not delete or alter these placeholders.
+  - If the raw text already includes a table image link and/or a verbatim table block, do NOT add a second “Table X description” section or duplicate the same table image outside the verbatim block.
+
 - **CRITICAL FOR DIAGRAMS AND IMAGES:**
   You will receive images of the PDF pages along with the extracted text.
   For each page that contains diagrams, charts, schematics, graphs, or technical figures:
