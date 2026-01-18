@@ -1,9 +1,12 @@
 # Environment variables (contains API keys)
 .env
 
-# Output directory
-#output_markdown/
-#test_output/
+# Output directories (generated)
+output_markdown/
+test_output/
+
+# Local conversion outputs (never commit)
+outputs/
 # Python cache
 __pycache__/
 *.pyc

@@ -16,7 +16,7 @@ This is a one-time conversion tool that favors quality over performance. The out
 
 - Extracts PDF Table of Contents to intelligently chunk the document
 - Preserves all images and diagrams from the PDF
-- Uses Google's Gemini API to format and clean up extracted text
+- Uses an LLM (Gemini by default; optional Anthropic Claude support) to format and clean up extracted text
 - Converts tables, code blocks, and technical content to proper Markdown
 - Creates a master index file for easy navigation
 - Configurable via environment variables and command-line arguments
@@ -49,13 +49,15 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-4. Set up your API key:
+4. Set up your API key(s):
 ```bash
 cp .env.example .env
-# Edit .env and add your Google API key
+# Edit .env and add your API key(s)
 ```
 
-Get your API key from [Google AI Studio](https://aistudio.google.com/)
+Get API keys from:
+- Gemini: [Google AI Studio](https://aistudio.google.com/)
+- Anthropic: Anthropic Console
 
 ## Configuration
 
@@ -64,8 +66,39 @@ Get your API key from [Google AI Studio](https://aistudio.google.com/)
 Create a `.env` file based on `.env.example`:
 
 ```bash
+# LLM Provider Selection
+# - gemini (default): uses GOOGLE_API_KEY + Gemini models
+# - anthropic: uses ANTHROPIC_API_KEY + Claude models
+LLM_PROVIDER=gemini
+
+# Optional: throttle LLM request rate (shared across worker threads)
+# 0 disables throttling.
+LLM_RPS=0
+
+# Optional: retry/backoff tuning
+# Vision requests often hit stricter limits; defaults are higher for vision.
+LLM_MAX_RETRIES_TEXT=5
+LLM_MAX_RETRIES_VISION=10
+LLM_BACKOFF_BASE_SECONDS=1
+LLM_MAX_BACKOFF_SECONDS=60
+
+# Optional: strict mode to reduce hallucinations (recommended for datasheets)
+# When enabled, the tool will reject LLM outputs that introduce new "technical tokens"
+# (e.g., hex values, bit ranges, numeric values with units) that were not present in the extracted source text.
+LLM_STRICT=1
+
+# Optional: render resolution multiplier for page images sent to vision models
+# (higher = sharper but slower/more tokens). 2.0 is a good default.
+LLM_PAGE_IMAGE_ZOOM=2.0
+
 # Google API Configuration
 GOOGLE_API_KEY=your_api_key_here
+
+# Vision behavior for Gemini:
+# - auto: only send images when we detected/extracted diagrams/images
+# - always: render and send page images for every processed page in a section
+# - never: never send images (text-only)
+LLM_VISION_MODE=auto
 
 # Vision model - used for pages with diagrams/images (multimodal)
 LLM_MODEL_NAME=gemini-2.5-flash
@@ -73,12 +106,59 @@ LLM_MODEL_NAME=gemini-2.5-flash
 # Text-only model - used for pages without images (faster/cheaper)
 LLM_MODEL_TEXT_ONLY=gemini-2.5-flash
 
+# Anthropic (Claude) Configuration (only used when LLM_PROVIDER=anthropic)
+ANTHROPIC_API_KEY=your_api_key_here
+
+# Vision behavior for Anthropic:
+# - always: render and send page images for every processed page in a section (best quality; higher cost)
+# - auto: only send images when we detected/extracted diagrams/images
+# - never: never send images (text-only)
+ANTHROPIC_VISION_MODE=auto
+
+# Vision model - used for pages with diagrams/images (multimodal)
+ANTHROPIC_MODEL_NAME=claude-sonnet-4-5-20250929
+
+# Text-only model - used for pages without images (faster/cheaper)
+ANTHROPIC_MODEL_TEXT_ONLY=claude-sonnet-4-5-20250929
+
+# Max output tokens per request (Claude)
+ANTHROPIC_MAX_OUTPUT_TOKENS=8192
+
 # Default paths (optional, can override via command line)
 PDF_PATH=cc1312r7.pdf
 OUTPUT_DIR=output_markdown
 ```
 
 The tool automatically selects the appropriate model based on whether a page contains diagrams or images. You can use different models for each purpose (e.g., a more capable model for vision tasks).
+
+### Anthropic quick start
+
+1. Set in `.env`:
+   - `LLM_PROVIDER=anthropic`
+   - `ANTHROPIC_API_KEY=...`
+   - Optionally override `ANTHROPIC_MODEL_NAME` / `ANTHROPIC_MODEL_TEXT_ONLY`
+
+2. Smoke test (fast, no PDF required):
+```bash
+python pdf2md.py --smoke-test --provider anthropic
+```
+
+Or use the helper script (loads `.env` automatically):
+```bash
+./scripts/smoke_test_anthropic.sh
+```
+
+3. Convert a real PDF (recommended helper):
+```bash
+./scripts/convert_pdf_anthropic.sh -i /path/to/manual.pdf -o outputs/manual
+```
+
+Notes:
+- `-o/--output` must be a **directory**, not a `.md` filename.
+- We recommend writing outputs under `outputs/` (git-ignored) so you can keep results locally without committing them.
+- For big PDFs, start conservative: `-w 2 --llm-rps 0.5` and increase gradually.
+- If you want Claude to use vision even on pages without extracted diagrams, set `ANTHROPIC_VISION_MODE=always` (higher cost).
+- For datasheets / register maps where correctness is critical, set `LLM_STRICT=1`.
 
 ### Prompt Template (prompt.txt)
 
@@ -99,10 +179,90 @@ Convert a PDF using default settings:
 python pdf2md.py
 ```
 
+### Use Anthropic Claude (instead of Gemini)
+
+Via environment variable:
+```bash
+LLM_PROVIDER=anthropic python pdf2md.py -i manual.pdf -o output_md
+```
+
+Via command-line:
+```bash
+python pdf2md.py -i manual.pdf -o output_md --provider anthropic
+```
+
+### Use Gemini (Google)
+Via environment variable:
+```bash
+LLM_PROVIDER=gemini python pdf2md.py -i manual.pdf -o output_md
+```
+
+Via command-line:
+```bash
+python pdf2md.py -i manual.pdf -o output_md --provider gemini
+```
+
 ### Specify Input and Output
 
 ```bash
 python pdf2md.py -i /path/to/manual.pdf -o output_directory
+```
+
+### Force re-generation (overwrite existing output)
+
+By default, the tool will **resume** and skip sections that already have output files. To re-run after changing prompts/settings/code:
+
+```bash
+python pdf2md.py -i manual.pdf -o output_md --force
+```
+
+### Process only specific pages (cheaper iteration)
+
+When iterating on extraction quality, you can limit work to specific PDF pages (1-indexed):
+
+```bash
+python pdf2md.py -i manual.pdf -o output_md --pages "9,11-13"
+```
+
+This will only process sections that intersect those pages (and will only extract/send those pages to the LLM).
+
+### Datasheets workflow (recommended for repeatable validation)
+
+This repo can optionally use a `datasheets` submodule to store **public** source PDFs and their conversion outputs in a consistent structure.
+
+- **Critical**: do **not** store confidential / NDA / proprietary PDFs in `datasheets/`.
+
+Convert a datasheet into the `datasheets/` structure:
+
+```bash
+./scripts/datasheets_convert.sh \
+  --manufacturer nxp \
+  --doc-id AN13917 \
+  --pdf "/path/to/AN13917.pdf" \
+  --provider anthropic \
+  --workers 2 \
+  --llm-rps 0.5
+```
+
+#### Page-slice iteration without touching `datasheets/` (PAGE TEST MODE)
+
+If you pass `--pages` through to `pdf2md.py`, `scripts/datasheets_convert.sh` automatically switches to **PAGE TEST MODE**:
+
+- Outputs go under `outputs/page_tests/...` (git-ignored)
+- The `datasheets/` submodule is **not** modified
+
+Example:
+
+```bash
+./scripts/datasheets_convert.sh \
+  --manufacturer nxp \
+  --doc-id AN13917 \
+  --pdf "/path/to/AN13917.pdf" \
+  --provider anthropic \
+  --workers 2 \
+  --llm-rps 0.5 \
+  --force \
+  -- --pages "8-12"
 ```
 
 ### Use Custom Prompt Template
@@ -116,6 +276,13 @@ python pdf2md.py -i manual.pdf -o output_md -p custom_prompt.txt
 ```bash
 # Use 8 parallel workers for faster processing
 python pdf2md.py -i manual.pdf -o output_md -w 8
+```
+
+### Throttle LLM request rate (avoid provider rate limits)
+
+```bash
+# Cap to ~1 request/second total (shared across workers)
+python pdf2md.py -i manual.pdf -o output_md --provider anthropic --llm-rps 1
 ```
 
 ### Command Line Options
@@ -178,6 +345,7 @@ output_markdown/
 - Python 3.7+
 - PyMuPDF (fitz) - PDF processing
 - google-generativeai - Gemini API access
+- anthropic - Anthropic Claude API access
 - python-dotenv - Environment variable management
 - Pillow (PIL) - Image processing for multimodal API
 
@@ -192,6 +360,26 @@ Check current pricing at [Google AI Studio](https://aistudio.google.com/).
 For a 2100-page technical manual, expect to process several million tokens. The dual-model approach helps reduce costs by using text-only processing for pages without diagrams.
 
 ## Troubleshooting
+### "Error code: 404 ... not_found_error ... model: ..."
+- Your Anthropic model name is not valid for your account/API.
+- Set `ANTHROPIC_MODEL_NAME` (and optionally `ANTHROPIC_MODEL_TEXT_ONLY`) to a valid model id.
+
+### "Error: Missing dependency PyMuPDF (module 'fitz')"
+- Install deps in your active environment:
+```bash
+python -m pip install -r requirements.txt
+```
+
+### Pip fails inside conda `(base)` with `Invalid version: '4.0.0-unsupported'`
+- This is usually caused by a broken installed package metadata in that environment (often `pyodbc`).
+- Recommended: use a clean venv:
+```bash
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install -U pip setuptools wheel packaging
+python -m pip install -r requirements.txt
+```
+
 
 ### "Error: GOOGLE_API_KEY is not set"
 - Make sure you created a `.env` file with your API key

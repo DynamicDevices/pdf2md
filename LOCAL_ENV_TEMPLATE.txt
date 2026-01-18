@@ -1,0 +1,22 @@
+Local `.env` template (DO NOT COMMIT SECRETS)
+
+1) Copy to `.env` manually:
+   cp LOCAL_ENV_TEMPLATE.txt .env
+
+2) Edit `.env` and replace PASTE_YOUR_KEY_HERE with your rotated key.
+
+--- BEGIN TEMPLATE ---
+# Select provider: gemini | anthropic
+LLM_PROVIDER=anthropic
+
+# Anthropic (Claude)
+ANTHROPIC_API_KEY=PASTE_YOUR_KEY_HERE
+ANTHROPIC_MODEL_NAME=claude-sonnet-4-5-20250929
+ANTHROPIC_MODEL_TEXT_ONLY=claude-sonnet-4-5-20250929
+ANTHROPIC_MAX_OUTPUT_TOKENS=8192
+
+# Default paths (optional; can override via CLI)
+PDF_PATH=cc1312r7.pdf
+OUTPUT_DIR=output_markdown
+--- END TEMPLATE ---
+
