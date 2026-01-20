@@ -1201,30 +1201,55 @@ def convert_pdf_to_markdown(pdf_path, output_dir, prompt_file="prompt.txt", max_
             blocks = page.get_text("dict")["blocks"]
 
             # Check for and extract embedded images (bitmaps)
+            #
+            # NOTE: In some PDFs, PyMuPDF returns image blocks (type==1) that do NOT
+            # include an "xref" key (e.g. inline images). Previously we assumed xref
+            # always exists and emitted noisy warnings like: KeyError: 'xref'.
             embedded_images_found = False
+            inline_img_count = 0
+            skipped_img_blocks = 0
             for block in blocks:
-                if block["type"] == 1:  # This is an embedded image block
-                    try:
-                        img_xref = block["xref"]
-                        if img_xref == 0:
+                if block.get("type") != 1:
+                    continue
+
+                try:
+                    img_xref = block.get("xref", 0) or 0
+                    if img_xref:
+                        img = doc.extract_image(img_xref)
+                        img_bytes = img.get("image") or b""
+                        img_ext = img.get("ext") or "png"
+                        if not img_bytes:
+                            skipped_img_blocks += 1
                             continue
 
-                        img = doc.extract_image(img_xref)
-                        img_bytes = img["image"]
-                        img_ext = img["ext"]
-
                         img_filename = f"page_{page_num + 1}_img_{img_xref}.{img_ext}"
-                        img_path = os.path.join(img_dir, img_filename)
+                    else:
+                        # Inline image blocks: save the bytes directly if present.
+                        img_bytes = block.get("image") or b""
+                        img_ext = block.get("ext") or "png"
+                        if not img_bytes:
+                            skipped_img_blocks += 1
+                            continue
 
-                        with open(img_path, "wb") as img_file:
-                            img_file.write(img_bytes)
+                        inline_img_count += 1
+                        img_filename = f"page_{page_num + 1}_img_inline_{inline_img_count}.{img_ext}"
 
-                        image_references.append(f"./images/{img_filename}")
-                        embedded_images_found = True
-                        print(f"    Extracted embedded image: {img_filename}")
+                    img_path = os.path.join(img_dir, img_filename)
+                    with open(img_path, "wb") as img_file:
+                        img_file.write(img_bytes)
 
-                    except Exception as e:
-                        print(f"  Warning: Could not extract embedded image on page {page_num + 1}: {e}")
+                    image_references.append(f"./images/{img_filename}")
+                    embedded_images_found = True
+                    print(f"    Extracted embedded image: {img_filename}")
+
+                except Exception:
+                    # Avoid spamming logs for PDFs that have many tiny inline images.
+                    skipped_img_blocks += 1
+
+            if skipped_img_blocks:
+                print(
+                    f"  Warning: Skipped {skipped_img_blocks} embedded image block(s) on page {page_num + 1} (missing data or unsupported format)"
+                )
 
             # Check if page has real diagrams (not just tables/headers)
             # Use smart heuristics to filter false positives
