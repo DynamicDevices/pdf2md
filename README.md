@@ -388,7 +388,7 @@ python -m pip install -r requirements.txt
 ### "Error: Could not extract Table of Contents"
 - The tool requires a PDF with a proper ToC/bookmarks structure
 - Check if your PDF has a ToC by opening it in a PDF reader
-- Consider manually splitting PDFs without ToC structure
+- If the PDF has no bookmarks/ToC, re-run with `--no-toc` to process the whole PDF (or your selected `--pages`) as a single section
 
 ### LLM API rate limits
 - The script implements automatic exponential backoff (1s, 2s, 4s, 8s, 16s delays)

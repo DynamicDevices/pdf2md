@@ -990,7 +990,7 @@ def _extract_page_text_with_tables(page, img_dir, page_num, y_min=None, y_max=No
     return "".join(out_parts), table_image_refs
 
 
-def convert_pdf_to_markdown(pdf_path, output_dir, prompt_file="prompt.txt", max_workers=4, llm_provider=None, force=False, pages=None):
+def convert_pdf_to_markdown(pdf_path, output_dir, prompt_file="prompt.txt", max_workers=4, llm_provider=None, force=False, pages=None, no_toc=False):
     """
     Main function to convert the PDF to a structured set of Markdown files.
 
@@ -1072,9 +1072,16 @@ def convert_pdf_to_markdown(pdf_path, output_dir, prompt_file="prompt.txt", max_
     # Use simple=False so we can access destination coordinates for same-page section splits.
     toc = doc.get_toc(simple=False)
     if not toc:
-        print("Error: Could not extract Table of Contents. Aborting.")
-        print("This script relies on a ToC to logically chunk the file.")
-        return
+        if not no_toc:
+            print("Error: Could not extract Table of Contents. Aborting.")
+            print("This script relies on a ToC to logically chunk the file.")
+            print("Tip: re-run with --no-toc to process the whole PDF (or your selected --pages) as a single section.")
+            return
+
+        # Fallback mode for PDFs without bookmarks/ToC: create a single synthetic ToC entry.
+        synthetic_title = os.path.splitext(os.path.basename(pdf_path))[0]
+        toc = [[1, synthetic_title, 1, {}]]
+        print("Warning: No PDF Table of Contents found; continuing in --no-toc mode (single section).", flush=True)
 
     print(f"Found {len(toc)} sections in the Table of Contents.")
 
@@ -1613,6 +1620,13 @@ Configuration:
     )
 
     parser.add_argument(
+        "--no-toc",
+        action="store_true",
+        help="Allow PDFs without an embedded Table of Contents/bookmarks. "
+             "In this mode, the converter processes the whole PDF (or your selected --pages) as a single section.",
+    )
+
+    parser.add_argument(
         "--llm-rps",
         dest="llm_rps",
         type=float,
@@ -1679,6 +1693,7 @@ Configuration:
         args.llm_provider,
         args.force,
         pages=args.pages,
+        no_toc=args.no_toc,
     )
 
 
